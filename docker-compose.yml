@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  ff14-bot:
+    build: .
+    restart: unless-stopped
+    volumes:
+      # Mount the latest_event.json so data persists even if container restarts
+      - ./latest_event.json:/app/latest_event.json
+    environment:
+      # You can override env vars here if needed
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
