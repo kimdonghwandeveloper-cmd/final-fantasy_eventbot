@@ -10,9 +10,7 @@ RUN pip install uv
 # Copy project files
 COPY pyproject.toml uv.lock ./
 COPY src ./src
-COPY .env .env
-# Copy latest_event.json if it exists (optional, mostly for local dev)
-# In production, this file is created at runtime.
+# .env is handled by Railway Variables, do not copy it.
 
 # Install dependencies
 RUN uv sync --frozen
