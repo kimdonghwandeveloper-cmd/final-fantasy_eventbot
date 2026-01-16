@@ -8,7 +8,7 @@ WORKDIR /app
 RUN pip install uv
 
 # Copy project files
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 # .env is handled by Railway Variables, do not copy it.
 
