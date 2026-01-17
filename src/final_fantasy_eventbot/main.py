@@ -82,8 +82,7 @@ def send_discord_webhook(event: Dict[str, str]) -> None:
         "description": f"**기간**: {event['date']}\n[이벤트 보러가기]({event['link']})",
         "url": event['link'],
         "color": 0x58b9ff,  # FF14-ish Blue
-        "image": {"url": event['thumbnail']},
-        "footer": {"text": "FF14 Event Bot by Antigravity"}
+        "image": {"url": event['thumbnail']}
     }
     
     payload = {"username": "FF14 Event Bot", "embeds": [embed]}
@@ -115,7 +114,6 @@ def send_summary_webhook(events: List[Dict[str, str]]) -> None:
         "title": "📋 현재 진행 중인 이벤트 목록",
         "description": description,
         "color": 0x34eb92,  # Green-ish for summary
-        "footer": {"text": "FF14 Event Bot - Startup Summary"}
     }
     
     payload = {"username": "FF14 Event Bot", "embeds": [embed]}
