@@ -22,5 +22,4 @@ __pycache__
 *.pyc
 .DS_Store
 
-# Test scripts
-test_fake_event.py
+

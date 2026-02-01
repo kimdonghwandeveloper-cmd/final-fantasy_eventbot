@@ -3,6 +3,7 @@ import time
 import json
 import logging
 import random
+import re
 import argparse
 from typing import List, Optional, Dict, Any
 
@@ -143,6 +144,8 @@ def fetch_events() -> List[Dict[str, str]]:
     
     try:
         response = requests.get(TARGET_URL, headers=headers, timeout=10)
+        # Force UTF-8 as valid FF14 pages are UTF-8, but sometimes headers miss it
+        response.encoding = "utf-8"
         response.raise_for_status()
     except Exception as e:
         logger.error(f"Network error fetching events: {e}")
@@ -185,6 +188,25 @@ def fetch_events() -> List[Dict[str, str]]:
             thumbnail = ""
             if img_tag:
                 src = img_tag.get("src")
+            else:
+                # Fallback: Check for background-image in .banner_img
+                banner_img = item.find(class_="banner_img")
+                if banner_img and banner_img.get("style"):
+                    # Extract url('...') from style
+                    style = banner_img.get("style")
+                    # Simple parse: look for url('...') or url("...")
+                    if "url('" in style:
+                        src = style.split("url('")[1].split("')")[0]
+                    elif 'url("' in style:
+                        src = style.split('url("')[1].split('")')[0]
+                    elif "url(" in style:
+                         src = style.split("url(")[1].split(")")[0]
+                    else:
+                        src = ""
+                else:
+                    src = ""
+
+            if src:
                 # Handle protocol-relative URLs (//image.ff14...)
                 if src.startswith("//"):
                     thumbnail = "https:" + src
@@ -206,6 +228,83 @@ def fetch_events() -> List[Dict[str, str]]:
             
     # Note: The site usually returns newest first.
     return event_list
+
+
+def enrich_event_info(event: Dict[str, str]) -> Dict[str, str]:
+    """
+    Visit the event detail page to extract more accurate date and title information.
+    Best-effort approach: returns modified event or original if extraction fails.
+    """
+    try:
+        logger.info(f"Enriching info for: {event['title']} ({event['link']})")
+        resp = requests.get(event['link'], headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        # Force UTF-8 encoding as apparent_encoding might be wrong for some pages
+        resp.encoding = "utf-8"
+        resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        
+        # 1. Title Enrichment (OG Title or Title Tag)
+        # Often the detail page has a full title (e.g. "Valentione's Day: ~Subtitle~")
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            new_title = og_title.get("content").strip()
+            # If the new title is significantly longer or different, use it.
+            # Simple heuristic: if it contains the original title, it's likely better.
+            if len(new_title) > len(event['title']):
+                logger.info(f"Updated title: {event['title']} -> {new_title}")
+                event['title'] = new_title
+
+        # 2. Image Enrichment (OG Image)
+        # The detail page usually provides a high-res banner image via og:image
+        og_image = soup.find("meta", property="og:image")
+        if og_image and og_image.get("content"):
+            new_image = og_image.get("content").strip()
+            # Ensure it's an absolute URL (though og:image usually is)
+            if new_image.startswith("//"):
+                new_image = "https:" + new_image
+            elif new_image.startswith("/"):
+                new_image = "https://www.ff14.co.kr" + new_image
+            
+            if new_image != event['thumbnail']:
+                logger.info(f"Updated image: {event['thumbnail']} -> {new_image}")
+                event['thumbnail'] = new_image
+
+        # 3. Date Enrichment (Regex Search in Body)
+        # Look for patterns like "2026.01.27 ~ 2026.02.09" or "26.01.27 ~ 02.09"
+        # We search the entire text content for simplicity
+        text_content = soup.get_text()
+        
+        # Regex Explanation:
+        # \d{2,4}      : Year (26 or 2026)
+        # [\.\-]       : Separator
+        # \d{1,2}      : Month (1 or 01)
+        # \d{1,2}      : Day
+        # .*?          : Any char (space, day name like (화), time)
+        # ~            : Range separator
+        # This matches: "26.1.27(화) 17:00 ~ 2.9(월) 23:59"
+        date_pattern = re.compile(r"(\d{2,4}[\.\-]\d{1,2}[\.\-]\d{1,2}).*?~.*?(\d{1,2}[\.\-]\d{1,2})")
+        match = date_pattern.search(text_content)
+        
+        if match:
+            # We found a range!
+            # full match string might be very long if we use .*?, so let's try to capture the date part cleanly.
+            # Actually, standardizing the date string is better.
+            start_date = match.group(1)
+            end_date = match.group(2) # This might just be "2.9" or "26.2.9"
+            
+            # The match itself (group(0)) will contain the full text "26.1.27(화) 17:00 ~ 2.9"
+            # Let's clean it up for display.
+            full_text = match.group(0).strip()
+            # Truncate if it got too greedy (e.g. captured whole paragraph), though .*? is non-greedy.
+            if len(full_text) < 50:
+                 logger.info(f"Updated date: {event['date']} -> {full_text}")
+                 event['date'] = full_text
+            
+    except Exception as e:
+        logger.warning(f"Failed to enrich event info: {e}")
+    
+    return event
 
 
 def crawling_job(is_startup: bool = False) -> None:
@@ -259,6 +358,8 @@ def crawling_job(is_startup: bool = False) -> None:
         
         # Send notifications from Oldest -> Newest order (for Discord readability)
         for event in reversed(new_events):
+            # Enchant event data with real date/title before sending
+            enrich_event_info(event)
             send_discord_webhook(event)
             # Update DB immediately after sending to avoid duplicates if crash occurs
             save_latest_event(event['id']) 
