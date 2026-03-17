@@ -33,35 +33,40 @@ logger = logging.getLogger(__name__)
 
 # --- Helper Functions ---
 
-def load_latest_event() -> Optional[str]:
+def load_latest_event() -> Optional[set]:
     """
-    Load the last known event ID from the local JSON file.
-    
+    Load the known event ID set from the local JSON file.
+
     Returns:
-        Optional[str]: The latest event ID URL, or None if file doesn't exist.
+        Optional[set]: Set of known event ID URLs, or None if file doesn't exist.
     """
     if not os.path.exists(LATEST_EVENT_FILE):
         return None
     try:
         with open(LATEST_EVENT_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("id")
+            # Backward compatibility: support old single-id format
+            if "ids" in data:
+                return set(data["ids"])
+            if "id" in data:
+                return {data["id"]}
+            return None
     except Exception as e:
         logger.error(f"Failed to load latest event file: {e}")
         return None
 
 
-def save_latest_event(event_id: str) -> None:
+def save_latest_event(event_ids: List[str]) -> None:
     """
-    Save the latest event ID to the local JSON file to prevent duplicates.
-    
+    Save the current event ID list to the local JSON file to prevent duplicates.
+
     Args:
-        event_id (str): The unique ID (URL) of the newest event.
+        event_ids (List[str]): All currently known event IDs.
     """
     try:
         with open(LATEST_EVENT_FILE, "w", encoding="utf-8") as f:
-            json.dump({"id": event_id}, f, indent=4)
-        logger.debug(f"Updated latest event ID to {event_id}")
+            json.dump({"ids": event_ids}, f, indent=4)
+        logger.debug(f"Updated known event IDs ({len(event_ids)} total)")
     except Exception as e:
         logger.error(f"Failed to save latest event file: {e}")
 
@@ -230,41 +235,34 @@ def crawling_job(is_startup: bool = False) -> None:
         logger.warning("No events fetched.")
         return
 
-    latest_id = load_latest_event()
+    known_ids = load_latest_event()
 
     # -- Startup Logic --
     # If explicitly requested via CLI flag, send summary of ALL active events
     if is_startup and events:
         logger.info("Startup Mode: Sending summary...")
         send_summary_webhook(events)
-    
-    # If first run (no DB), just save baseline to prevent spamming old events
-    if latest_id is None:
+
+    # If first run (no DB), save all current events as baseline
+    if known_ids is None:
         logger.info("No previous event data found. Saving baseline...")
-        if events:
-            # Save the top (newest) event as the latest known
-            save_latest_event(events[0]['id'])
+        save_latest_event([e['id'] for e in events])
         return
 
     # -- Detection Logic --
-    # Find events that are newer than latest_id
-    # We iterate from the top; if we meet latest_id, we stop.
-    new_events = []
-    
-    for event in events:
-        if event['id'] == latest_id:
-            break
-        new_events.append(event)
-    
+    # New events = events whose ID is not in the known set
+    new_events = [e for e in events if e['id'] not in known_ids]
+
     if new_events:
         logger.info(f"Found {len(new_events)} new event(s)!")
-        
+
         # Send notifications from Oldest -> Newest order (for Discord readability)
         for event in reversed(new_events):
             send_discord_webhook(event)
-            # Update DB immediately after sending to avoid duplicates if crash occurs
-            save_latest_event(event['id']) 
-            time.sleep(1) # Prevent rate-limiting
+            time.sleep(1)  # Prevent rate-limiting
+
+    # Always update the known set to the current full event list
+    save_latest_event([e['id'] for e in events])
 
 
 def main():
