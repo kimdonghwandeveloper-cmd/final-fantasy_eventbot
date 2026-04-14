@@ -14,6 +14,8 @@ wheels/
 
 # Data & Logs
 latest_event.json
+event_hash_cache.json
+test_cache.json
 *.log
 log*.txt
 

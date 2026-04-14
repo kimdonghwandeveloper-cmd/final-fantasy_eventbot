@@ -12,6 +12,10 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+from final_fantasy_eventbot.llm_middleware import MoogleSummarizer
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # --- Configuration & Constants ---
 load_dotenv()
 
@@ -31,6 +35,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# LLM 미들웨어 초기화
+moogle_summarizer = MoogleSummarizer()
 
 # --- Helper Functions ---
 
@@ -83,12 +89,15 @@ def send_discord_webhook(event: Dict[str, str]) -> None:
         logger.warning("No Discord Webhook URL found. Skipping notification.")
         return
 
+    # 요약 정보가 존재하면 description에 추가
+    summary_text = f"\n\n**[모그리의 요약 쿠뽀!]**\n{event.get('summary', '')}" if event.get('summary') else ""
+    
     embed = {
         "title": f"🎉 새로운 이벤트 알림: {event['title']}",
-        "description": f"**기간**: {event['date']}\n[이벤트 보러가기]({event['link']})",
+        "description": f"**기간**: {event['date']}\n[이벤트 보러가기]({event['link']}){summary_text}",
         "url": event['link'],
         "color": 0x58b9ff,  # FF14-ish Blue
-        "image": {"url": event['thumbnail']}
+        "image": {"url": event.get('thumbnail', '')}
     }
     
     payload = {"username": "FF14 Event Bot", "embeds": [embed]}
@@ -249,6 +258,11 @@ def enrich_event_info(event: Dict[str, str]) -> Dict[str, str]:
         
         soup = BeautifulSoup(resp.text, "html.parser")
         
+        # 본문 텍스트 추출하여 LLM 요약을 위해 저장
+        content_area = soup.select_one(".evt_view") or soup.select_one(".view_cont") or soup
+        event['raw_text'] = content_area.get_text(separator="\n", strip=True)[:2500]
+
+        
         # 1. Title Enrichment (OG Title or Title Tag)
         # Often the detail page has a full title (e.g. "Valentione's Day: ~Subtitle~")
         og_title = soup.find("meta", property="og:title")
@@ -351,17 +365,38 @@ def crawling_job(is_startup: bool = False) -> None:
     new_events = [e for e in events if e['id'] not in known_ids]
 
     if new_events:
-        logger.info(f"Found {len(new_events)} new event(s)!")
+        # 도배 방지 안전장치: DB에 없는 밀린 이벤트들 중, 제일 예전 것부터 1분마다 1개씩 순차적으로 발송
+        event_to_process = new_events[-1]
+        logger.info(f"Found {len(new_events)} new event(s)! Processing exactly 1 to prevent spam (ID: {event_to_process['id']})")
 
-        # Send notifications from Oldest -> Newest order (for Discord readability)
-        for event in reversed(new_events):
-            # Enchant event data with real date/title before sending
-            enrich_event_info(event)
-            send_discord_webhook(event)
-            time.sleep(1)  # Prevent rate-limiting
+        # Enchant event data with real date/title before sending
+        enrich_event_info(event_to_process)
+        
+        # 본문이 성공적으로 추출되었다면 모그리 요약 파이프라인 통과
+        if 'raw_text' in event_to_process:
+            summary = moogle_summarizer.process_event_text(event_to_process['id'], event_to_process['raw_text'])
+            if summary:
+                event_to_process['summary'] = summary
+            
+        send_discord_webhook(event_to_process)
 
-    # Always update the known set to the current full event list
-    save_latest_event([e['id'] for e in events])
+        # 발송을 완료한 1개의 이벤트만 DB(known_ids)에 저장
+        # (나머지 미처리 이벤트는 다음 1분 루프 때 순차적으로 처리됨)
+        if known_ids is None:
+            known_ids = set()
+        
+        known_ids.add(event_to_process['id'])
+        
+        # 현재까지 처리 완료된 ID들만 저장
+        save_latest_event(list(known_ids))
+
+    else:
+        # 더 이상 처리할 새로운 이벤트가 없을 때, 
+        # 사이트에서 내려간 옛날 이벤트 ID를 known_ids에서 정리(메모리 누수 방지)
+        current_event_ids = {e['id'] for e in events}
+        # 교집합: 현재 사이트에 있는 이벤트 중 이미 처리된 것들만 남김
+        cleaned_ids = known_ids.intersection(current_event_ids)
+        save_latest_event(list(cleaned_ids))
 
 
 def main():
