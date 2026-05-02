@@ -13,6 +13,9 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from final_fantasy_eventbot.llm_middleware import MoogleSummarizer
+from final_fantasy_eventbot.database import engine, SessionLocal, Base
+from final_fantasy_eventbot.models import EventRecord
+
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -25,7 +28,6 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # Target Settings
 TARGET_URL = "https://www.ff14.co.kr/news/event"
 BASE_URL = "https://www.ff14.co.kr"
-LATEST_EVENT_FILE = "latest_event.json"
 
 # Logging Configuration
 logging.basicConfig(
@@ -40,42 +42,44 @@ moogle_summarizer = MoogleSummarizer()
 
 # --- Helper Functions ---
 
-def load_latest_event() -> Optional[set]:
+def get_known_event_ids() -> Optional[set]:
     """
-    Load the known event ID set from the local JSON file.
+    Load the known event ID set from the database.
 
     Returns:
-        Optional[set]: Set of known event ID URLs, or None if file doesn't exist.
+        Optional[set]: Set of known event IDs, or None if DB is completely empty (baseline).
     """
-    if not os.path.exists(LATEST_EVENT_FILE):
-        return None
     try:
-        with open(LATEST_EVENT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            # Backward compatibility: support old single-id format
-            if "ids" in data:
-                return set(data["ids"])
-            if "id" in data:
-                return {data["id"]}
-            return None
+        with SessionLocal() as db:
+            records = db.query(EventRecord.id).all()
+            if not records:
+                return None
+            return {r[0] for r in records}
     except Exception as e:
-        logger.error(f"Failed to load latest event file: {e}")
+        logger.error(f"Failed to load event IDs from DB: {e}")
         return None
 
 
-def save_latest_event(event_ids: List[str]) -> None:
+def save_event_ids(event_ids: List[str]) -> None:
     """
-    Save the current event ID list to the local JSON file to prevent duplicates.
+    Save new event IDs to the database to prevent duplicates.
 
     Args:
-        event_ids (List[str]): All currently known event IDs.
+        event_ids (List[str]): List of newly processed event IDs.
     """
+    if not event_ids:
+        return
+        
     try:
-        with open(LATEST_EVENT_FILE, "w", encoding="utf-8") as f:
-            json.dump({"ids": event_ids}, f, indent=4)
-        logger.debug(f"Updated known event IDs ({len(event_ids)} total)")
+        with SessionLocal() as db:
+            for eid in event_ids:
+                existing = db.query(EventRecord).filter(EventRecord.id == eid).first()
+                if not existing:
+                    db.add(EventRecord(id=eid))
+            db.commit()
+        logger.debug(f"Saved {len(event_ids)} event IDs to DB")
     except Exception as e:
-        logger.error(f"Failed to save latest event file: {e}")
+        logger.error(f"Failed to save event IDs to DB: {e}")
 
 
 def send_discord_webhook(event: Dict[str, str]) -> None:
@@ -346,7 +350,7 @@ def crawling_job(is_startup: bool = False) -> None:
         logger.warning("No events fetched.")
         return
 
-    known_ids = load_latest_event()
+    known_ids = get_known_event_ids()
 
     # -- Startup Logic --
     # If explicitly requested via CLI flag, send summary of ALL active events
@@ -357,7 +361,7 @@ def crawling_job(is_startup: bool = False) -> None:
     # If first run (no DB), save all current events as baseline
     if known_ids is None:
         logger.info("No previous event data found. Saving baseline...")
-        save_latest_event([e['id'] for e in events])
+        save_event_ids([e['id'] for e in events])
         return
 
     # -- Detection Logic --
@@ -380,27 +384,16 @@ def crawling_job(is_startup: bool = False) -> None:
             
         send_discord_webhook(event_to_process)
 
-        # 발송을 완료한 1개의 이벤트만 DB(known_ids)에 저장
+        # 발송을 완료한 1개의 이벤트만 DB에 저장
         # (나머지 미처리 이벤트는 다음 1분 루프 때 순차적으로 처리됨)
-        if known_ids is None:
-            known_ids = set()
-        
-        known_ids.add(event_to_process['id'])
-        
-        # 현재까지 처리 완료된 ID들만 저장
-        save_latest_event(list(known_ids))
-
-    else:
-        # 더 이상 처리할 새로운 이벤트가 없을 때, 
-        # 사이트에서 내려간 옛날 이벤트 ID를 known_ids에서 정리(메모리 누수 방지)
-        current_event_ids = {e['id'] for e in events}
-        # 교집합: 현재 사이트에 있는 이벤트 중 이미 처리된 것들만 남김
-        cleaned_ids = known_ids.intersection(current_event_ids)
-        save_latest_event(list(cleaned_ids))
+        save_event_ids([event_to_process['id']])
 
 
 def main():
     """Application Entry Point"""
+    # Create DB tables if they don't exist
+    Base.metadata.create_all(bind=engine)
+
     # CLI Argument Parsing
     parser = argparse.ArgumentParser(description="FF14 KR Event Notification Bot")
     parser.add_argument(
